@@ -10,17 +10,25 @@ function sanitizeMessages(messages) {
   return messages.map(function(msg) {
     if (!Array.isArray(msg.content)) return msg;
     var cleanContent = msg.content.map(function(block) {
-      // If it's a document block, make sure it's only PDF - otherwise convert to text placeholder
       if (block.type === 'document') {
         var mediaType = block.source && block.source.media_type;
         if (mediaType !== 'application/pdf') {
-          return { type: 'text', text: '[File attachment — content not available]' };
+          return { type: 'text', text: '[File attachment]' };
         }
       }
       return block;
     });
     return Object.assign({}, msg, { content: cleanContent });
   });
+}
+
+function extractError(err) {
+  if (!err) return 'Unknown error';
+  if (typeof err === 'string') return err;
+  if (err.message) return err.message;
+  if (err.error && err.error.message) return err.error.message;
+  if (err.error && typeof err.error === 'string') return err.error;
+  return JSON.stringify(err);
 }
 
 export default async function handler(req, res) {
@@ -55,11 +63,11 @@ export default async function handler(req, res) {
     const data = await response.json();
 
     if (!response.ok) {
-      return res.status(response.status).json({ error: data.error?.message || 'API error' });
+      return res.status(response.status).json({ error: extractError(data.error || data) });
     }
 
     res.json(data);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: extractError(error) });
   }
 }
