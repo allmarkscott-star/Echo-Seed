@@ -129,6 +129,7 @@ export default function EchoSeed() {
   var [editingMsgText, setEditingMsgText] = useState('');
   var [saveWarning, setSaveWarning] = useState(false);
   var [initStatus, setInitStatus] = useState('Loading Echo Seed...');
+  var [dbAvailable, setDbAvailable] = useState(true);
 
   var endRef = useRef(null);
   var taRef = useRef(null);
@@ -150,37 +151,52 @@ export default function EchoSeed() {
         var dbConvs = await convRes.json();
         var dbMems = await memRes.json();
 
-        // Normalise conversations from DB
+        // Normalise conversation metadata from DB (no messages here anymore)
         var convs = (dbConvs || []).map(function(c) {
-          return { id: c.id, title: c.title, messages: c.messages || [], createdAt: c.created_at, updatedAt: c.updated_at };
+          return { id: c.id, title: c.title, createdAt: c.created_at, updatedAt: c.updated_at, messageCount: c.message_count || 0 };
         });
 
-        // Normalise memories from DB
         var mems = (dbMems || []).map(function(m) {
           return { text: m.text, timestamp: m.created_at };
         });
 
-        // If DB is empty, try to migrate from localStorage
+        // If DB is completely empty, migrate from localStorage (one-time)
         if (convs.length === 0) {
           setInitStatus('Migrating existing data...');
           var localConvs = localGet('echoseed-conversations', []);
           if (localConvs.length > 0) {
             for (var i = 0; i < localConvs.length; i++) {
+              var lc = localConvs[i];
               await fetch('/api/conversations', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(localConvs[i])
+                body: JSON.stringify({ id: lc.id, title: lc.title, createdAt: lc.createdAt, updatedAt: lc.updatedAt })
               });
+              var lcMessages = lc.messages || [];
+              for (var m = 0; m < lcMessages.length; m++) {
+                await fetch('/api/messages', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    conversation_id: lc.id,
+                    seq: m,
+                    role: lcMessages[m].role,
+                    content: lcMessages[m].content,
+                    displayText: lcMessages[m].displayText,
+                    imagePreviews: lcMessages[m].imagePreviews || null
+                  })
+                });
+              }
+              convs.push({ id: lc.id, title: lc.title, createdAt: lc.createdAt, updatedAt: lc.updatedAt, messageCount: lcMessages.length });
             }
-            convs = localConvs;
           } else {
-            var first = { id: generateId(), title: 'First conversation', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), messages: [] };
+            var first = { id: generateId(), title: 'First conversation', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
             await fetch('/api/conversations', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(first)
             });
-            convs = [first];
+            convs = [Object.assign({}, first, { messageCount: 0 })];
           }
         }
 
@@ -198,15 +214,27 @@ export default function EchoSeed() {
           }
         }
 
+        // Load messages for the first/active conversation only
+        var activeConv = convs[0];
+        var activeMessages = [];
+        if (activeConv) {
+          var msgRes = await fetch('/api/messages?conversation_id=' + encodeURIComponent(activeConv.id));
+          var dbMsgs = await msgRes.json();
+          activeMessages = (dbMsgs || []).map(function(m) {
+            return { role: m.role, content: m.content, displayText: m.display_text, imagePreviews: m.image_previews };
+          });
+        }
+
         setConversations(convs);
-        setActiveId(convs[0].id);
-        setMessages(convs[0].messages || []);
+        setActiveId(activeConv ? activeConv.id : null);
+        setMessages(activeMessages);
         setMemories(mems);
         setDbReady(true);
         setInitStatus('');
 
       } catch(err) {
-        // Fall back to localStorage
+        // Database unreachable - fall back entirely to localStorage (legacy full-blob mode)
+        setDbAvailable(false);
         setInitStatus('');
         var fallbackConvs = localGet('echoseed-conversations', []);
         var fallbackMems = localGet('echoseed-memories', []);
@@ -214,7 +242,7 @@ export default function EchoSeed() {
           var f = { id: generateId(), title: 'First conversation', createdAt: new Date().toISOString(), messages: [] };
           fallbackConvs = [f];
         }
-        setConversations(fallbackConvs);
+        setConversations(fallbackConvs.map(function(c) { return Object.assign({}, c, { messageCount: (c.messages || []).length }); }));
         setActiveId(fallbackConvs[0].id);
         setMessages(fallbackConvs[0].messages || []);
         setMemories(fallbackMems);
@@ -263,47 +291,107 @@ export default function EchoSeed() {
     );
   }
 
-  async function saveConvToDb(conv) {
+  function flagSaveWarning(label, errMsg) {
+    console.error(label, errMsg);
+    setSaveWarning(true);
+    setTimeout(function() { setSaveWarning(false); }, 8000);
+  }
+
+  async function touchConversation(convId, title, createdAt) {
+    if (!dbAvailable) return;
     try {
       var res = await fetch('/api/conversations', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(conv)
+        body: JSON.stringify({ id: convId, title: title, createdAt: createdAt, updatedAt: new Date().toISOString() })
       });
-      if (!res.ok) {
-        var errText = await res.text();
-        console.error('Failed to save conversation to database:', errText);
-        setSaveWarning(true);
-        setTimeout(function() { setSaveWarning(false); }, 8000);
-      }
+      if (!res.ok) flagSaveWarning('Failed to update conversation metadata:', await res.text());
     } catch(e) {
-      console.error('Failed to save conversation to database:', e.message);
-      setSaveWarning(true);
-      setTimeout(function() { setSaveWarning(false); }, 8000);
+      flagSaveWarning('Failed to update conversation metadata:', e.message);
     }
-    localSet('echoseed-conversations', conversations.map(function(c) { return c.id === conv.id ? conv : c; }));
   }
 
-  function switchConversation(id) {
+  async function appendMessage(convId, seq, msg) {
+    if (!dbAvailable) return;
+    try {
+      var res = await fetch('/api/messages', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          conversation_id: convId,
+          seq: seq,
+          role: msg.role,
+          content: msg.content,
+          displayText: msg.displayText,
+          imagePreviews: msg.imagePreviews || null
+        })
+      });
+      if (!res.ok) flagSaveWarning('Failed to save message:', await res.text());
+    } catch(e) {
+      flagSaveWarning('Failed to save message:', e.message);
+    }
+  }
+
+  async function truncateMessagesFrom(convId, fromSeq) {
+    if (!dbAvailable) return;
+    try {
+      await fetch('/api/messages?conversation_id=' + encodeURIComponent(convId) + '&fromSeq=' + fromSeq, { method: 'DELETE' });
+    } catch(e) {
+      flagSaveWarning('Failed to remove old messages:', e.message);
+    }
+  }
+
+  function persistLocalFallback(convId, newMessages) {
+    if (dbAvailable) return;
+    var local = localGet('echoseed-conversations', []);
+    var updated = local.map(function(c) { return c.id === convId ? Object.assign({}, c, { messages: newMessages, updatedAt: new Date().toISOString() }) : c; });
+    localSet('echoseed-conversations', updated);
+  }
+
+  async function switchConversation(id) {
     var conv = conversations.find(function(c) { return c.id === id; });
     if (!conv) return;
     setActiveId(id);
-    setMessages(conv.messages || []);
     setInput('');
     setPendingFiles([]);
     setEditingMsgIndex(null);
+
+    if (!dbAvailable) {
+      var local = localGet('echoseed-conversations', []);
+      var localConv = local.find(function(c) { return c.id === id; });
+      setMessages(localConv ? (localConv.messages || []) : []);
+      return;
+    }
+
+    setMessages([]);
+    try {
+      var res = await fetch('/api/messages?conversation_id=' + encodeURIComponent(id));
+      var dbMsgs = await res.json();
+      var loaded = (dbMsgs || []).map(function(m) {
+        return { role: m.role, content: m.content, displayText: m.display_text, imagePreviews: m.image_previews };
+      });
+      setMessages(loaded);
+    } catch(e) {
+      flagSaveWarning('Failed to load conversation:', e.message);
+    }
   }
 
   async function newConversation() {
     var title = 'New conversation';
-    var conv = { id: generateId(), title: title, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), messages: [] };
+    var createdAt = new Date().toISOString();
+    var conv = { id: generateId(), title: title, createdAt: createdAt, updatedAt: createdAt, messageCount: 0 };
     var updated = [conv].concat(conversations);
     setConversations(updated);
     setActiveId(conv.id);
     setMessages([]);
     setInput('');
     setPendingFiles([]);
-    await saveConvToDb(conv);
+    if (dbAvailable) {
+      await touchConversation(conv.id, title, createdAt);
+    } else {
+      var local = localGet('echoseed-conversations', []);
+      localSet('echoseed-conversations', [{ id: conv.id, title: title, createdAt: createdAt, updatedAt: createdAt, messages: [] }].concat(local));
+    }
     setTimeout(function() { setEditingId(conv.id); setEditingTitle(title); }, 100);
   }
 
@@ -311,16 +399,21 @@ export default function EchoSeed() {
     e.stopPropagation();
     var updated = conversations.filter(function(c) { return c.id !== id; });
     if (updated.length === 0) {
-      var fresh = { id: generateId(), title: 'New conversation', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), messages: [] };
+      var createdAt = new Date().toISOString();
+      var fresh = { id: generateId(), title: 'New conversation', createdAt: createdAt, updatedAt: createdAt, messageCount: 0 };
       updated = [fresh];
-      await saveConvToDb(fresh);
+      if (dbAvailable) await touchConversation(fresh.id, fresh.title, createdAt);
     }
     setConversations(updated);
     if (activeId === id) {
-      setActiveId(updated[0].id);
-      setMessages(updated[0].messages || []);
+      await switchConversation(updated[0].id);
     }
-    try { await fetch('/api/conversations?id=' + id, { method: 'DELETE' }); } catch(e) {}
+    if (dbAvailable) {
+      try { await fetch('/api/conversations?id=' + id, { method: 'DELETE' }); } catch(e) {}
+    } else {
+      var local = localGet('echoseed-conversations', []).filter(function(c) { return c.id !== id; });
+      localSet('echoseed-conversations', local);
+    }
   }
 
   function startRename(conv, e) {
@@ -337,17 +430,24 @@ export default function EchoSeed() {
     setEditingId(null);
     setEditingTitle('');
     var conv = updated.find(function(c) { return c.id === editingId; });
-    if (conv) await saveConvToDb(Object.assign({}, conv, { title: title }));
+    if (conv) {
+      if (dbAvailable) {
+        await touchConversation(conv.id, title, conv.createdAt);
+      } else {
+        var local = localGet('echoseed-conversations', []).map(function(c) { return c.id === editingId ? Object.assign({}, c, { title: title }) : c; });
+        localSet('echoseed-conversations', local);
+      }
+    }
   }
 
-  async function saveMessages(newMessages) {
-    var updatedAt = new Date().toISOString();
-    var updated = conversations.map(function(c) {
-      return c.id === activeId ? Object.assign({}, c, { messages: newMessages, updatedAt: updatedAt }) : c;
+  // Bumps the local sidebar's message count + updatedAt without re-saving full history
+  function bumpConversationLocally(convId, deltaCount) {
+    var nowIso = new Date().toISOString();
+    setConversations(function(prev) {
+      return prev.map(function(c) {
+        return c.id === convId ? Object.assign({}, c, { messageCount: (c.messageCount || 0) + deltaCount, updatedAt: nowIso }) : c;
+      });
     });
-    setConversations(updated);
-    var conv = updated.find(function(c) { return c.id === activeId; });
-    if (conv) await saveConvToDb(conv);
   }
 
   async function saveMem(text) {
@@ -422,7 +522,7 @@ export default function EchoSeed() {
     return conv ? conv.title : '';
   }
 
-  async function doSend(msgsToSend, snap) {
+  async function doSend(msgsToSend, snap, convId) {
     setLoading(true);
     try {
       var res = await fetch('/api/chat', {
@@ -442,14 +542,27 @@ export default function EchoSeed() {
         latestMems = await saveMem(newMems[i]);
       }
       var clean = cleanText(raw);
-      var withReply = msgsToSend.concat([{ role: 'assistant', content: clean, displayText: clean }]);
+      var assistantMsg = { role: 'assistant', content: clean, displayText: clean };
+      var withReply = msgsToSend.concat([assistantMsg]);
       setMessages(withReply);
-      await saveMessages(withReply);
+      if (dbAvailable) {
+        await appendMessage(convId, msgsToSend.length, assistantMsg);
+        await touchConversation(convId, getActiveTitle());
+        bumpConversationLocally(convId, 1);
+      } else {
+        persistLocalFallback(convId, withReply);
+      }
       speak(clean);
     } catch(err) {
-      var withErr = msgsToSend.concat([{ role: 'assistant', content: 'Something went wrong: ' + err.message, displayText: 'Something went wrong: ' + err.message }]);
+      var errMsg = { role: 'assistant', content: 'Something went wrong: ' + err.message, displayText: 'Something went wrong: ' + err.message };
+      var withErr = msgsToSend.concat([errMsg]);
       setMessages(withErr);
-      await saveMessages(withErr);
+      if (dbAvailable) {
+        await appendMessage(convId, msgsToSend.length, errMsg);
+        bumpConversationLocally(convId, 1);
+      } else {
+        persistLocalFallback(convId, withErr);
+      }
     } finally {
       setLoading(false);
     }
@@ -460,6 +573,7 @@ export default function EchoSeed() {
     var text = input.trim();
     var files = pendingFiles;
     var hasFiles = files.length > 0;
+    var convId = activeId;
 
     var fileBlocks = files.map(function(f) {
       if (f.isText) {
@@ -487,24 +601,39 @@ export default function EchoSeed() {
     var userMsg = { role: 'user', content: apiContent, displayText: displayText, imagePreviews: imagePreviews.length > 0 ? imagePreviews : null };
     var next = messages.concat([userMsg]);
     setMessages(next);
-    await saveMessages(next);
+    var seq = messages.length;
+    if (dbAvailable) {
+      await appendMessage(convId, seq, userMsg);
+      await touchConversation(convId, getActiveTitle());
+      bumpConversationLocally(convId, 1);
+    } else {
+      persistLocalFallback(convId, next);
+    }
     setInput('');
     setPendingFiles([]);
     if (taRef.current) taRef.current.style.height = 'auto';
-    await doSend(next, memories.slice());
+    await doSend(next, memories.slice(), convId);
   }
 
   async function commitMsgEdit(index) {
     var newText = editingMsgText.trim();
     if (!newText) { setEditingMsgIndex(null); return; }
-    var truncated = messages.slice(0, index + 1).map(function(m, i) {
-      return i === index ? Object.assign({}, m, { content: newText, displayText: newText }) : m;
-    });
+    var convId = activeId;
+    var editedMsg = Object.assign({}, messages[index], { content: newText, displayText: newText });
+    var truncated = messages.slice(0, index).concat([editedMsg]);
     setMessages(truncated);
-    await saveMessages(truncated);
     setEditingMsgIndex(null);
     setEditingMsgText('');
-    await doSend(truncated, memories.slice());
+
+    if (dbAvailable) {
+      await truncateMessagesFrom(convId, index);
+      await appendMessage(convId, index, editedMsg);
+      var removedCount = messages.length - truncated.length;
+      bumpConversationLocally(convId, -removedCount);
+    } else {
+      persistLocalFallback(convId, truncated);
+    }
+    await doSend(truncated, memories.slice(), convId);
   }
 
   function onKey(e) {
@@ -562,7 +691,7 @@ export default function EchoSeed() {
                     ) : (
                       <>
                         <div style={{ fontSize: 13, color: C.text, fontWeight: isActive ? 500 : 400, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis', paddingRight: 40 }}>{conv.title}</div>
-                        <div style={{ fontSize: 11, color: C.light, marginTop: 2 }}>{conv.messages && conv.messages.length > 0 ? conv.messages.length + ' messages · ' : ''}{formatDate(conv.updatedAt || conv.createdAt)}</div>
+                        <div style={{ fontSize: 11, color: C.light, marginTop: 2 }}>{conv.messageCount > 0 ? conv.messageCount + ' messages · ' : ''}{formatDate(conv.updatedAt || conv.createdAt)}</div>
                         <div className="conv-actions" style={{ position: 'absolute', right: 6, top: '50%', transform: 'translateY(-50%)', display: 'flex', gap: 2, opacity: 0, transition: 'opacity .15s' }}>
                           <button onClick={function(e) { startRename(conv, e); }} style={{ width: 22, height: 22, borderRadius: 4, background: 'transparent', color: C.muted, fontSize: 11, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>✏️</button>
                           <button onClick={function(e) { deleteConversation(conv.id, e); }} style={{ width: 22, height: 22, borderRadius: 4, background: 'transparent', color: C.muted, fontSize: 11, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>🗑️</button>
