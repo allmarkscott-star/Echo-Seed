@@ -178,6 +178,7 @@ export default function EchoSeed() {
   var [editingMsgIndex, setEditingMsgIndex] = useState(null);
   var [editingMsgText, setEditingMsgText] = useState('');
   var [saveWarning, setSaveWarning] = useState(false);
+  var [fileSizeWarning, setFileSizeWarning] = useState('');
   var [initStatus, setInitStatus] = useState('Loading Echo Seed...');
   var [dbAvailable, setDbAvailable] = useState(true);
 
@@ -542,22 +543,32 @@ export default function EchoSeed() {
       if (isText) {
         var textReader = new FileReader();
         textReader.onload = function(ev) {
-          resolve({ textContent: ev.target.result, type: file.type, preview: null, name: file.name, isPdf: false, isImage: false, isText: true });
+          resolve({ textContent: ev.target.result, type: file.type, preview: null, name: file.name, isPdf: false, isImage: false, isText: true, size: file.size });
         };
         textReader.readAsText(file);
       } else {
         var reader = new FileReader();
         reader.onload = function(ev) {
-          resolve({ base64: ev.target.result.split(',')[1], type: file.type, preview: isImage ? ev.target.result : null, name: file.name, isPdf: isPdf, isImage: isImage, isText: false });
+          resolve({ base64: ev.target.result.split(',')[1], type: file.type, preview: isImage ? ev.target.result : null, name: file.name, isPdf: isPdf, isImage: isImage, isText: false, size: file.size });
         };
         reader.readAsDataURL(file);
       }
     });
   }
 
+  var MAX_TOTAL_FILE_BYTES = 1.5 * 1024 * 1024;
+
   async function handleFileSelect(e) {
     var files = Array.prototype.slice.call(e.target.files);
     if (!files.length) return;
+    var existingSize = pendingFiles.reduce(function(sum, f) { return sum + (f.size || 0); }, 0);
+    var newSize = files.reduce(function(sum, f) { return sum + f.size; }, 0);
+    if (existingSize + newSize > MAX_TOTAL_FILE_BYTES) {
+      setFileSizeWarning('That\u2019s too large to send safely \u2014 please keep attachments under about 1.5MB combined. Try a smaller image, or fewer files at once.');
+      setTimeout(function() { setFileSizeWarning(''); }, 7000);
+      e.target.value = '';
+      return;
+    }
     var results = await Promise.all(files.map(readOneFile));
     setPendingFiles(function(prev) { return prev.concat(results); });
     e.target.value = '';
@@ -586,7 +597,7 @@ export default function EchoSeed() {
       if (contextMessages.length > 0 && contextMessages[0].role !== 'user') {
         contextMessages = contextMessages.slice(1);
       }
-      contextMessages = trimHeavyContent(contextMessages, 2);
+      contextMessages = trimHeavyContent(contextMessages, 1);
       var activeTitle = getActiveTitle();
       var useModel = isTradingConversation(activeTitle) ? 'claude-opus-4-7' : 'claude-sonnet-4-6';
       var res = await fetch('/api/chat', {
@@ -643,6 +654,15 @@ export default function EchoSeed() {
     var files = pendingFiles;
     var hasFiles = files.length > 0;
     var convId = activeId;
+
+    if (hasFiles) {
+      var totalSize = files.reduce(function(sum, f) { return sum + (f.size || 0); }, 0);
+      if (totalSize > MAX_TOTAL_FILE_BYTES) {
+        setFileSizeWarning('That\u2019s too large to send safely \u2014 please remove a file or use something smaller (under about 1.5MB combined).');
+        setTimeout(function() { setFileSizeWarning(''); }, 7000);
+        return;
+      }
+    }
 
     var fileBlocks = files.map(function(f) {
       if (f.isText) {
@@ -871,6 +891,12 @@ export default function EchoSeed() {
             )}
             <div ref={endRef} />
           </div>
+
+          {fileSizeWarning && (
+            <div style={{ padding: '8px 18px', background: '#FEF3CD', borderTop: '1px solid #F5D78E', flexShrink: 0, fontSize: 12, color: '#7A5C00' }}>
+              ⚠️ {fileSizeWarning}
+            </div>
+          )}
 
           {pendingFiles.length > 0 && (
             <div style={{ padding: '6px 18px', background: C.bg, borderTop: '1px solid ' + C.border, display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0, flexWrap: 'wrap' }}>
